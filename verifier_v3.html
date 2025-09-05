@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Abiball Ticket-Verifizierung (Datei, fester Public Key – v4, fixed baseline + fixed Stichtag)</title>
+  <style>
+    :root { --bg:#0b1020; --card:#0f172a; --muted:#9aa4b2; --ok:#16a34a; --err:#dc2626; --border:#1f2937; }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;background:var(--bg);color:#e5e7eb}
+    .wrap{max-width:900px;margin:0 auto;padding:20px;display:grid;gap:16px}
+    h1{font-size:clamp(22px,3vw,28px);margin:0}
+    .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
+    .panel h2{margin:0 0 10px;font-size:16px;color:#cbd5e1}
+    .stage{position:relative;width:100%;aspect-ratio:1008/612;border-radius:12px;overflow:hidden;background:#000;border-radius:12px;overflow:hidden;background:#000}
+    #video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;transition:filter .2s ease,opacity .2s ease}
+    /* Statt display:none: Kamera bleibt aktiv, Video bleibt gerendert */
+    .video-dim{filter:blur(2px);opacity:.2}
+    #overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center}
+    .status{display:flex;gap:8px;align-items:center;color:#9aa4b2;font-size:14px;margin-top:8px}
+    .dot{width:8px;height:8px;border-radius:999px;background:#6b7280}
+    .dot.ok{background:var(--ok)} .dot.err{background:var(--err)}
+    .continueWrap{margin-top:10px;display:none}
+    .btn{background:#1f2937;border:1px solid #374151;padding:10px 12px;border-radius:10px;color:#e5e7eb;cursor:pointer;font-weight:600}
+    .foot{color:#94a3b8;font-size:13px}
+    code{color:#cbd5e1;background:#0b1220;padding:2px 6px;border-radius:6px;border:1px solid #1e293b}
+
+    /* --- Ticket preview layers to mimic generated card --- */
+    #overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:0}
+    .ticketCard{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+    .ticketCard .surface{position:relative;width:100%;height:100%;}
+    .ticketCard .surface .layer{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;image-rendering:auto}
+    .ticketCard .surface .svg{position:absolute;inset:0;display:block;width:100%;height:100%}
+    /* Nutze Arial Rounded wenn verfügbar; Baseline so setzen, dass y die Oberkante ist (wie bei PIL) */
+    .ticketText{
+      font-family:"Arial Rounded MT Bold","Arial Rounded MT","Arial",ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,sans-serif;
+      fill:#000;
+      dominant-baseline:text-before-edge; /* macht y = Oberkante statt Text-Baseline */
+    }
+  
+    .invalidBtn{position:absolute;inset:0;background:#1f0b0b;border:2px solid #7f1d1d;color:#fecaca;font-weight:800;letter-spacing:.3px;font-size:clamp(16px,2.4vw,18px);cursor:pointer;border-radius:12px}
+    
+    .invalidBtn:hover{ filter:brightness(1.05); }
+    .invalidBtn:active{ transform:translateY(1px); box-shadow:0 6px 16px rgba(220,38,38,.3), inset 0 2px 0 rgba(0,0,0,.2); }
+
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Abiball Ticket-Verifizierung (Datei, fester Public Key – v4)</h1>
+
+    <div class="panel">
+      <h2>Scanner/Ergebnis</h2>
+      <div class="stage">
+        <video id="video" autoplay muted playsinline></video>
+        <div id="overlay"></div>
+      </div>
+      <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">Warte auf Kamera…</span></div>
+      <div id="continueWrap" class="continueWrap">
+        <button id="continueBtn" class="btn">Weiter</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="foot">
+        <div>QR-Payload (Base64-URL JSON): <code>{"n":"…","d":"…","t":0-3,"s":"…"}</code></div>
+        <div>Signatur wird über exakt <code>{"n":...,"d":...,"t":...}</code> geprüft (kompakt, Reihenfolge n,d,t).</div>
+        <div><strong>Public Key eintragen:</strong> Unten bei <code>RAW_PUBLIC_KEY_BASE64</code> den 32-Byte Ed25519-Öffentlich-Schlüssel (Base64-URL, mit <code>-</code>/<code>_</code>) einsetzen.</div>
+        <div><strong>Stichtag:</strong> fest auf <code>02.07.2027</code> gesetzt.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ZXing (QR-Scanner) -->
+  <script src="https://unpkg.com/@zxing/browser@latest"></script>
+  <script>
+    // ===== Konfiguration =====
+    var BLACKLIST_VALID_MS = 5000;
+    var BLACKLIST_INVALID_MS = 3000;
+
+    // Stichtag fest auf 2027-07-02 (02.07.2027)
+    var REF_DATE_YYYY_MM_DD = "2027-07-02";
+
+    // --- Helpers for DOB formatting and age display (mirror of app.py rules) ---
+    function parseISODate(iso){
+      // expect 'YYYY-MM-DD'
+      if(typeof iso!=='string' || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return null;
+      var p=iso.split('-').map(function(s){return parseInt(s,10)});
+      return new Date(Date.UTC(p[0], p[1]-1, p[2]));
+    }
+    function formatDE(iso){
+      var d=parseISODate(iso);
+      if(!d) return iso||'';
+      var dd=String(d.getUTCDate()).padStart(2,'0');
+      var mm=String(d.getUTCMonth()+1).padStart(2,'0');
+      var yyyy=d.getUTCFullYear();
+      return dd+'.'+mm+'.'+yyyy;
+    }
+    function calcAgeOn(born, ref){
+      var y = ref.getUTCFullYear() - born.getUTCFullYear();
+      var mref = ref.getUTCMonth(), dref = ref.getUTCDate();
+      var mb = born.getUTCMonth(), db = born.getUTCDate();
+      if (mref < mb || (mref===mb && dref < db)) y -= 1;
+      return y;
+    }
+    function addDaysUTC(d, days){
+      var x=new Date(d.getTime());
+      x.setUTCDate(x.getUTCDate()+days);
+      return x;
+    }
+    function buildAgeDisplay(isoBirth, refDateObj){
+      var b=parseISODate(isoBirth);
+      if(!b) return '';
+      var ref = refDateObj instanceof Date ? refDateObj : new Date();
+      var ageNow = calcAgeOn(b, ref);
+      if(ageNow >= 21) return '21+';
+      var ageTom = calcAgeOn(b, addDaysUTC(ref, 1));
+      if(ageTom === ageNow + 1 && ageTom <= 21){
+        return '('+ageNow+'-'+ageTom+')';
+      }
+      return '('+ageNow+')';
+    }
+    function getRefDate(){
+      var parts = REF_DATE_YYYY_MM_DD.split('-').map(function(s){return parseInt(s,10)});
+      return new Date(Date.UTC(parts[0], parts[1]-1, parts[2]));
+    }
+
+    // >>>>>>>> HIER DEIN ÖFFENTLICHER SCHLÜSSEL (Base64-URL, 32 Byte) <<<<<<<<
+    var RAW_PUBLIC_KEY_BASE64 = "fny_DPMhIw3VIOzRnFKf7nalb2XXWqpg8_1d8Dyqxwk=";
+    // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    // ===== Elemente =====
+    var video = document.getElementById('video');
+    var overlay = document.getElementById('overlay');
+    var statusDot = document.getElementById('statusDot');
+    var statusText = document.getElementById('statusText');
+    var continueWrap = document.getElementById('continueWrap');
+    var continueBtn = document.getElementById('continueBtn');
+
+    // ===== State =====
+    var publicKey = null;
+    var lastShown = null;
+    var blacklist = {};
+    var codeReader = null;
+    var scanControls = null;
+    var continuousAvailable = false;
+
+    // ===== Utils =====
+    function escapeHtml(s){return String(s).replace(/[&<>\"]/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]);});}
+    function updateStatus(ok,msg){statusDot.className='dot'+(ok===true?' ok':(ok===false?' err':''));statusText.textContent=msg;}
+    // Wichtig: Wir verstecken das Video NIE via display:none, um iOS/Safari-Prompts zu vermeiden.
+    function showVideo(show){ if(show){ video.classList.remove('video-dim'); overlay.style.display='none'; } else { video.classList.add('video-dim'); overlay.style.display='flex'; } }
+    function base64UrlToBytes(b64url){var b64=b64url.replace(/-/g,'+').replace(/_/g,'/');while(b64.length%4!==0)b64+='=';var bin=atob(b64);var out=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)out[i]=bin.charCodeAt(i);return out;}
+    function buildDataJsonOrdered(n,d,t){return new TextEncoder().encode(JSON.stringify({n:n,d:d,t:t}));}
+    function decodeQrPayload(text){try{var raw=base64UrlToBytes(text);var json=new TextDecoder().decode(raw);return JSON.parse(json);}catch(e1){try{return JSON.parse(text);}catch(e2){return null;}}}
+    function isBlacklisted(q){var now=Date.now(),until=blacklist[q]; if(until&&until>now)return true; if(until&&until<=now)delete blacklist[q]; return false;}
+    function addToBlacklist(q,ms){blacklist[q]=Date.now()+ms;}
+
+    function stopDecoder(){
+      if (scanControls) { try { scanControls.stop(); } catch(_){ } scanControls = null; }
+      // WICHTIG: Stream bleibt aktiv – video.srcObject NICHT anfassen, kein reset().
+    }
+    function restartScan(){
+      stopDecoder();
+      clearUI();
+      showVideo(true); // Video bleibt sichtbar (gedimmt entfernt)
+      setTimeout(startDecoderOnly, 30);
+    }
+
+    function importPublicKeyFromBase64(rawB64){
+      var keyBytes=base64UrlToBytes(rawB64);
+      return crypto.subtle.importKey('raw',keyBytes,{name:'Ed25519'},false,['verify']);
+    }
+    function verifySignature(payload){
+      if(!publicKey||!payload||typeof payload!=='object')return Promise.resolve(false);
+      var n=payload.n,d=payload.d,t=payload.t,s=payload.s;
+      if(typeof n!=='string'||typeof d!=='string'||typeof t!=='number'||typeof s!=='string')return Promise.resolve(false);
+      var sig=base64UrlToBytes(s);
+      var data=buildDataJsonOrdered(n,d,t);
+      return crypto.subtle.verify({name:'Ed25519'},publicKey,sig,data);
+    }
+
+    function clearUI(){ overlay.innerHTML=''; continueWrap.style.display='none'; lastShown=null; }
+
+    function renderPreview(data){
+      overlay.innerHTML='';
+
+      // Build card container
+      var wrap=document.createElement('div');
+      wrap.className='ticketCard';
+      var surface=document.createElement('div');
+      surface.className='surface';
+
+      // Background + overlay layers (names as in app.py)
+      var bg=document.createElement('img'); bg.className='layer'; bg.alt='BG'; bg.src='IMG_0059.png';
+      var ov=document.createElement('img'); ov.className='layer'; ov.alt='Overlay'; ov.src='IMG_0061.png';
+
+      // SVG text layer with original canvas coordinates (1008x612)
+      var svgNS='http://www.w3.org/2000/svg';
+      var svg=document.createElementNS(svgNS,'svg');
+      svg.setAttribute('class','svg');
+      svg.setAttribute('viewBox','0 0 1008 612');
+      svg.setAttribute('preserveAspectRatio','xMidYMid meet');
+
+      // Compute display strings
+      var name = (typeof data.n==='string') ? data.n : '';
+      var dobISO = (typeof data.d==='string') ? data.d : '';
+      var dobDisp = formatDE(dobISO);
+      var t = (typeof data.t==='number') ? data.t : 0;
+
+      var refDate = getRefDate(); // fixed 2027-07-02
+      var ageDisp = buildAgeDisplay(dobISO, refDate); // '21+' or '(a-b)' or '(a)'
+
+      // Text positions & sizes (exact match to app.py canvas layout)
+      // x=40; name_y=100; dob_y=180; age_y=240; font size 48
+      function addText(txt, x, y){
+        if(!txt) return;
+        var te=document.createElementNS(svgNS,'text');
+        te.setAttribute('x', String(x));
+        te.setAttribute('y', String(y));
+        te.setAttribute('class','ticketText');
+        te.setAttribute('font-size','48');
+        te.textContent=txt;
+        svg.appendChild(te);
+      }
+
+      addText(name, 40, 100);
+      addText(dobDisp, 40, 180);
+      if(ageDisp){ addText(ageDisp, 40, 240); }
+
+      // Compose
+      surface.appendChild(bg);
+      surface.appendChild(ov);
+      surface.appendChild(svg);
+      wrap.appendChild(surface);
+      overlay.appendChild(wrap);
+    }
+    function renderInvalidButton(){
+      overlay.innerHTML='';
+      var btn=document.createElement('button');
+      btn.className='invalidBtn';
+      btn.textContent='Ungültig. Scanne nochmal';
+      btn.addEventListener('click', function(){
+        if(lastShown) addToBlacklist(lastShown, BLACKLIST_INVALID_MS);
+        restartScan();
+        updateStatus(null,'Bereit für den nächsten Scan.');
+      });
+      overlay.appendChild(btn);
+    }
+
+    function handleResult(qrText){
+      if (!qrText || isBlacklisted(qrText)) return;
+      var payload = decodeQrPayload(qrText);
+      verifySignature(payload).then(function(valid){
+        stopDecoder(); // nur Decoder anhalten, Stream bleibt an
+        if (valid) {
+          showVideo(false); // Video bleibt sichtbar (gedimmt), Overlay zeigt Ergebnis
+          renderPreview(payload);
+          lastShown = qrText;
+          updateStatus(true,'Gültig – Vorschau angezeigt.');
+          setTimeout(function(){ continueWrap.style.display='block'; }, 500);
+        } else {
+          showVideo(false);
+          renderInvalidButton();
+          lastShown = qrText;
+          updateStatus(false,'Ungültig – bitte erneut scannen.');
+        }
+      });
+    }
+
+    function startDecoderOnly(){
+      if (!codeReader) codeReader = new ZXingBrowser.BrowserQRCodeReader();
+
+      // bevorzugt: decodeFromStream (nutzt bestehenden Stream)
+      if (typeof codeReader.decodeFromStream === 'function' && video.srcObject) {
+        continuousAvailable = true;
+        codeReader.decodeFromStream(video.srcObject, video, function(result, err, controls){
+          if (controls) scanControls = controls;
+          if (result) handleResult(result.getText());
+        });
+        updateStatus(null,'Kamera aktiv – scanne ein Ticket.');
+        return;
+      }
+
+      // Fallback 1: decodeFromConstraints (kann neuen getUserMedia-Pfad wählen)
+      if (typeof codeReader.decodeFromConstraints === 'function') {
+        codeReader.decodeFromConstraints({ video: { facingMode: { ideal: 'environment' }, width:{ideal:640}, height:{ideal:480} } }, video, function(result, err, controls){
+          if (controls) scanControls = controls;
+          if (result) handleResult(result.getText());
+        });
+        updateStatus(null,'Kamera aktiv – scanne ein Ticket.');
+        return;
+      }
+
+      // Fallback 2: Polling-Loop via decodeFromVideoElement
+      function loop(){
+        codeReader.decodeFromVideoElement(video).then(function(res){
+          if (res) handleResult(res.getText());
+          else setTimeout(loop, 80);
+        }).catch(function(){ setTimeout(loop, 120); });
+      }
+      loop();
+      updateStatus(null,'Kamera aktiv – scanne ein Ticket.');
+    }
+
+    async function startAll(){
+      // Public Key laden/prüfen
+      if(!RAW_PUBLIC_KEY_BASE64 || RAW_PUBLIC_KEY_BASE64.indexOf('PASTE_RAW_PUBLIC_KEY_BASE64_HERE') !== -1){
+        updateStatus(false,'Bitte in der Datei den Public Key bei RAW_PUBLIC_KEY_BASE64 eintragen.');
+        return;
+      }
+      try { publicKey = await importPublicKeyFromBase64(RAW_PUBLIC_KEY_BASE64.trim()); }
+      catch(e){ updateStatus(false,'Öffentlicher Schlüssel ungültig.'); return; }
+
+      // Kamera einmalig starten (Prompt erscheint nur beim ersten Mal)
+      try{
+        if(!video.srcObject){
+          var stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:640}, height:{ideal:480}},audio:false});
+          video.srcObject = stream; // behalten! Nie auf null setzen.
+        }
+      }catch(e){
+        updateStatus(false,'Kamera-Fehler: '+e.message);
+        return;
+      }
+
+      startDecoderOnly();
+    }
+
+    continueBtn.addEventListener('click', function(){
+      if(!lastShown){ restartScan(); return; }
+      addToBlacklist(lastShown, BLACKLIST_VALID_MS);
+      restartScan();
+    });
+
+    // Autostart
+    startAll();
+  </script>
+</body>
+</html>

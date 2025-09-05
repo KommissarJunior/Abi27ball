@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Abiball Ticket-Verifizierung – Keyboard-Scanner</title>
+  <style>
+    :root { --bg:#0b1020; --card:#0f172a; --muted:#9aa4b2; --ok:#16a34a; --err:#dc2626; --border:#1f2937; }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;background:var(--bg);color:#e5e7eb}
+    .wrap{max-width:900px;margin:0 auto;padding:20px;display:grid;gap:16px}
+    h1{font-size:clamp(22px,3vw,28px);margin:0}
+    .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
+    .panel h2{margin:0 0 10px;font-size:16px;color:#cbd5e1}
+    .stage{position:relative;width:100%;aspect-ratio:1008/612;border-radius:12px;overflow:hidden;background:#000}
+    #overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+    .status{display:flex;gap:8px;align-items:center;color:#9aa4b2;font-size:14px;margin-top:8px}
+    .dot{width:8px;height:8px;border-radius:999px;background:#6b7280}
+    .dot.ok{background:var(--ok)} .dot.err{background:var(--err)}
+    .foot{color:#94a3b8;font-size:13px}
+    code{color:#cbd5e1;background:#0b1220;padding:2px 6px;border-radius:6px;border:1px solid #1e293b}
+
+    /* Ticket-Preview-Layer (exakte Positionen & Größe wie in app.py) */
+    .ticketCard{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+    .ticketCard .surface{position:relative;width:100%;height:100%;}
+    .ticketCard .surface .layer{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;image-rendering:auto}
+    .ticketCard .surface .svg{position:absolute;inset:0;display:block;width:100%;height:100%}
+    .ticketText{
+      font-family:"Arial Rounded MT Bold","Arial Rounded MT","Arial",ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,sans-serif;
+      fill:#000; dominant-baseline:text-before-edge;
+    }
+    .invalidOverlay{
+      position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+      background:rgba(127,29,29,.9);border:2px solid #7f1d1d;color:#fecaca;font-weight:800;
+      letter-spacing:.2px;font-size:clamp(18px,2.8vw,22px);text-align:center;padding:16px
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Abiball Ticket-Verifizierung – Keyboard-Scanner</h1>
+
+    <div class="panel">
+      <h2>Scanner/Ergebnis</h2>
+      <div class="stage">
+        <div id="overlay"></div>
+      </div>
+      <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">Bereit – scanne einen Code (dieses Fenster fokussiert lassen).</span></div>
+    </div>
+
+    <div class="panel">
+      <div class="foot">
+        <div>QR-Payload (Base64-URL JSON): <code>{"n":"…","d":"…","t":0-3,"s":"…"}</code></div>
+        <div>Signatur über exakt <code>{"n":...,"d":...,"t":...}</code> (kompakt, Reihenfolge n,d,t).</div>
+        <div><strong>Public Key eintragen:</strong> in <code>RAW_PUBLIC_KEY_BASE64</code> unten den 32-Byte Ed25519-Key (Base64-URL) einsetzen.</div>
+        <div><strong>Stichtag für Altersanzeige:</strong> <code>REF_DATE_YYYY_MM_DD</code> auf den in der Generator-App verwendeten Stichtag setzen.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ===== Konfiguration =====
+    // >>>>>>>> DEIN ÖFFENTLICHER SCHLÜSSEL (Base64-URL, 32 Byte) <<<<<<<<
+    var RAW_PUBLIC_KEY_BASE64 = "fny_DPMhIw3VIOzRnFKf7nalb2XXWqpg8_1d8Dyqxwk=";
+    // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    // Optional: Stichtag wie in AGE_AT_DATE (YYYY-MM-DD). Leer -> heutiges Datum.
+    var REF_DATE_YYYY_MM_DD = "2027-07-02"; // z.B. "2025-06-21"
+
+    // ===== Elemente =====
+    var overlay = document.getElementById('overlay');
+    var statusDot = document.getElementById('statusDot');
+    var statusText = document.getElementById('statusText');
+
+    // ===== Utils =====
+    function setStatus(ok,msg){
+      statusDot.className = 'dot' + (ok===true?' ok':(ok===false?' err':''));
+      statusText.textContent = msg;
+    }
+    function escapeHtml(s){return String(s).replace(/[&<>\"]/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]);});}
+    function base64UrlToBytes(b64url){
+      var b64=b64url.replace(/-/g,'+').replace(/_/g,'/');
+      while(b64.length%4!==0) b64+='=';
+      var bin=atob(b64), out=new Uint8Array(bin.length);
+      for(var i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
+      return out;
+    }
+    function decodeQrPayload(text){
+      // bevorzugt: Base64-URL -> JSON; Fallback: direkt JSON
+      try{
+        var raw = base64UrlToBytes(text);
+        var json = new TextDecoder().decode(raw);
+        return JSON.parse(json);
+      }catch(e1){
+        try{ return JSON.parse(text); }catch(e2){ return null; }
+      }
+    }
+    async function importPublicKeyFromBase64(rawB64){
+      var keyBytes = base64UrlToBytes(rawB64.trim());
+      return crypto.subtle.importKey('raw', keyBytes, {name:'Ed25519'}, false, ['verify']);
+    }
+    function buildDataJsonOrdered(n,d,t){
+      return new TextEncoder().encode(JSON.stringify({n:n,d:d,t:t}));
+    }
+    function parseISODate(iso){
+      if(typeof iso!=='string'||!(/^\d{4}-\d{2}-\d{2}$/.test(iso))) return null;
+      var p=iso.split('-').map(function(s){return parseInt(s,10)});
+      return new Date(Date.UTC(p[0], p[1]-1, p[2]));
+    }
+    function formatDE(iso){
+      var d=parseISODate(iso);
+      if(!d) return iso||'';
+      var dd=String(d.getUTCDate()).padStart(2,'0');
+      var mm=String(d.getUTCMonth()+1).padStart(2,'0');
+      var yyyy=d.getUTCFullYear();
+      return dd+'.'+mm+'.'+yyyy;
+    }
+    function calcAgeOn(born, ref){
+      var y = ref.getUTCFullYear() - born.getUTCFullYear();
+      var mref = ref.getUTCMonth(), dref = ref.getUTCDate();
+      var mb = born.getUTCMonth(), db = born.getUTCDate();
+      if (mref < mb || (mref===mb && dref < db)) y -= 1;
+      return y;
+    }
+    function addDaysUTC(d, days){ var x=new Date(d.getTime()); x.setUTCDate(x.getUTCDate()+days); return x; }
+    function getRefDate(){
+      if(REF_DATE_YYYY_MM_DD && /^\d{4}-\d{2}-\d{2}$/.test(REF_DATE_YYYY_MM_DD)){
+        var p=REF_DATE_YYYY_MM_DD.split('-').map(function(s){return parseInt(s,10)});
+        return new Date(Date.UTC(p[0],p[1]-1,p[2]));
+      }
+      // Fallback: heute (UTC) – passend zur Alterslogik
+      var now=new Date(); return new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()));
+    }
+    function buildAgeDisplay(isoBirth, ref){
+      var b=parseISODate(isoBirth); if(!b) return '';
+      var ageNow = calcAgeOn(b, ref);
+      if (ageNow >= 18) return '18+';
+      var ageTom = calcAgeOn(b, addDaysUTC(ref, 1));
+      if (ageTom === ageNow + 1 && ageTom <= 18) return '('+ageNow+'-'+ageTom+')';
+      return '('+ageNow+')';
+    }
+
+    // ===== Rendering =====
+    function clearOverlay(){ overlay.innerHTML=''; }
+    function renderInvalid(){
+      clearOverlay();
+      var div=document.createElement('div');
+      div.className='invalidOverlay';
+      div.textContent='Ungültig, scanne nochmal';
+      overlay.appendChild(div);
+    }
+    function renderCard(data){
+      clearOverlay();
+      var wrap=document.createElement('div');
+      wrap.className='ticketCard';
+      var surface=document.createElement('div');
+      surface.className='surface';
+
+      // Hintergrund & Overlay-Bild (Namen wie in app.py)
+      var bg=document.createElement('img'); bg.className='layer'; bg.alt='BG'; bg.src='IMG_0059.png';
+      var ov=document.createElement('img'); ov.className='layer'; ov.alt='Overlay'; ov.src='IMG_0061.png';
+
+      // SVG-Textlayer mit Originalkoordinaten (1008x612)
+      var svgNS='http://www.w3.org/2000/svg';
+      var svg=document.createElementNS(svgNS,'svg');
+      svg.setAttribute('class','svg');
+      svg.setAttribute('viewBox','0 0 1008 612');
+      svg.setAttribute('preserveAspectRatio','xMidYMid meet');
+
+      var name = (typeof data.n==='string') ? data.n : '';
+      var dobISO = (typeof data.d==='string') ? data.d : '';
+      var dobDisp = formatDE(dobISO);
+      var refDate = getRefDate();
+      var ageDisp = buildAgeDisplay(dobISO, refDate);
+
+      function addText(txt, x, y){
+        if(!txt) return;
+        var te=document.createElementNS(svgNS,'text');
+        te.setAttribute('x', String(x));
+        te.setAttribute('y', String(y));
+        te.setAttribute('class','ticketText');
+        te.setAttribute('font-size','48');
+        te.textContent=txt;
+        svg.appendChild(te);
+      }
+      // Exakte Positionen/Größe wie in app.py: x=40; name_y=100; dob_y=180; age_y=240; size=48
+      addText(name, 40, 100);
+      addText(dobDisp, 40, 180);
+      if(ageDisp){ addText(ageDisp, 40, 240); }
+
+      surface.appendChild(bg);
+      surface.appendChild(ov);
+      surface.appendChild(svg);
+      wrap.appendChild(surface);
+      overlay.appendChild(wrap);
+    }
+
+    // ===== Verifikation =====
+    var publicKey = null;
+    async function verifySignature(payload){
+      if(!publicKey||!payload||typeof payload!=='object') return false;
+      var n=payload.n, d=payload.d, t=payload.t, s=payload.s;
+      if(typeof n!=='string'||typeof d!=='string'||typeof t!=='number'||typeof s!=='string') return false;
+      var sig = base64UrlToBytes(s);
+      var data = buildDataJsonOrdered(n,d,t);
+      try{ return await crypto.subtle.verify({name:'Ed25519'}, publicKey, sig, data); }
+      catch(_){ return false; }
+    }
+
+    // ===== Keyboard-Scanner =====
+    var buffer = '';
+    var flushTimer = null;
+    function resetFlushTimer(){
+      if (flushTimer) clearTimeout(flushTimer);
+      // Wenn nach 800ms keine Zeichen mehr kommen, Buffer verwerfen (gegen "hängende" Eingaben)
+      flushTimer = setTimeout(function(){ buffer=''; }, 800);
+    }
+
+    async function processScan(text){
+      if(!text) return;
+      setStatus(null,'Prüfe…');
+      var payload = decodeQrPayload(text);
+      if(!payload){ renderInvalid(); setStatus(false,'Ungültig – scanne nochmal.'); return; }
+      var ok = await verifySignature(payload);
+      if(ok){
+        renderCard(payload);
+        setStatus(true,'Gültig – Karte angezeigt. Nächsten Code scannen…');
+      }else{
+        renderInvalid();
+        setStatus(false,'Ungültig – scanne nochmal.');
+      }
+    }
+
+    window.addEventListener('keydown', function(e){
+      // Scanner tippt Zeichen + Enter. Wir sammeln alle "druckbaren" Keys.
+      if (e.key === 'Enter'){
+        var text = buffer.trim();
+        buffer = '';
+        processScan(text);
+        e.preventDefault();
+        return;
+      }
+      if (e.key.length === 1){
+        buffer += e.key;
+        resetFlushTimer();
+      }
+    });
+
+    // ===== Start =====
+    (async function init(){
+      if(!RAW_PUBLIC_KEY_BASE64 || RAW_PUBLIC_KEY_BASE64.indexOf('PASTE_RAW_PUBLIC_KEY_BASE64_HERE')!==-1){
+        setStatus(false,'Bitte Public Key in RAW_PUBLIC_KEY_BASE64 eintragen.');
+        return;
+      }
+      try{
+        publicKey = await importPublicKeyFromBase64(RAW_PUBLIC_KEY_BASE64);
+      }catch(e){
+        setStatus(false,'Öffentlicher Schlüssel ungültig.');
+        return;
+      }
+      setStatus(null,'Bereit – scanne einen Code (dieses Fenster fokussiert lassen).');
+      clearOverlay(); // leerer Stage-Hintergrund
+    })();
+  </script>
+</body>
+</html>
